@@ -1,8 +1,34 @@
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const SUBDL_API_KEY = process.env.SUBDL_API_KEY || "";
 
-// User search results තාවකාලිකව මතක තබා ගැනීමට (serverless memory cache)
 const searchCache = new Map();
+
+const HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Referer": "https://subsource.net/"
+};
+
+function toSlug(input) {
+  return input
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-");
+}
+
+function cleanText(str) {
+  return str
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 async function tgApi(method, payload) {
   const res = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
@@ -38,77 +64,92 @@ async function sendDocumentBuffer(chatId, buffer, filename, caption = "") {
   return res.json();
 }
 
-// SubDL API / search helper
 async function searchSubDL(query) {
   const results = [];
   try {
-    if (SUBDL_API_KEY) {
-      const url = `https://api.subdl.com/api/v1/subtitles?api_key=${encodeURIComponent(SUBDL_API_KEY)}&query=${encodeURIComponent(query)}&subs_per_page=10`;
-      const res = await fetch(url);
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data.subtitles)) {
-          data.subtitles.slice(0, 8).forEach((item, idx) => {
-            const dlPath = item.url || item.download_link || "";
-            const fullDl = dlPath.startsWith("http")
-              ? dlPath
-              : dlPath
-              ? `https://dl.subdl.com${dlPath.startsWith("/") ? "" : "/"}${dlPath}`
-              : "";
-
-            if (fullDl) {
-              results.push({
-                id: `subdl_${idx}`,
-                source: "SubDL",
-                title: `${item.release_name || item.name || query} (${item.lang || "Sub"})`,
-                downloadUrl: fullDl,
-                suggestedName: `${(item.release_name || query).replace(/[^\w.-]+/g, "_")}.zip`
-              });
-            }
+    if (!SUBDL_API_KEY) return results;
+    const url = `https://api.subdl.com/api/v1/subtitles?api_key=${encodeURIComponent(
+      SUBDL_API_KEY
+    )}&query=${encodeURIComponent(query)}&subs_per_page=8`;
+    const res = await fetch(url);
+    if (!res.ok) return results;
+    const data = await res.json();
+    if (Array.isArray(data.subtitles)) {
+      data.subtitles.slice(0, 6).forEach((item, idx) => {
+        const dlPath = item.url || item.download_link || "";
+        const fullDl = dlPath.startsWith("http")
+          ? dlPath
+          : dlPath
+          ? `https://dl.subdl.com${dlPath.startsWith("/") ? "" : "/"}${dlPath}`
+          : "";
+        if (fullDl) {
+          results.push({
+            id: `subdl_${idx}`,
+            source: "SubDL",
+            title: `${item.release_name || item.name || query} (${item.lang || "Sub"})`,
+            downloadUrl: fullDl,
+            suggestedName: `${(item.release_name || query).replace(/[^\w.-]+/g, "_")}.zip`
           });
         }
-      }
+      });
     }
   } catch (e) {
-    console.error("SubDL search error:", e.message);
+    console.error("SubDL error:", e.message);
   }
   return results;
 }
 
-// SubSource search helper (basic HTML/endpoint fetch)
-async function searchSubSource(query) {
-  const results = [];
-  try {
-    const res = await fetch(`https://subsource.net/search?q=${encodeURIComponent(query)}`, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Mobile; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36"
-      }
-    });
-    if (res.ok) {
+async function searchSubSourceBySlug(query) {
+  const slug = toSlug(query);
+  if (!slug) return [];
+
+  const candidateUrls = [
+    `https://subsource.net/subtitles/${slug}/season-1`,
+    `https://subsource.net/subtitles/${slug}`
+  ];
+
+  const found = [];
+  const seenUrls = new Set();
+
+  for (const pageUrl of candidateUrls) {
+    try {
+      const res = await fetch(pageUrl, { headers: HEADERS });
+      if (!res.ok) continue;
+
       const html = await res.text();
-      // සරල link extraction (site structure අනුව පසුව තවත් adjust කළ හැක)
-      const linkRegex = /href="(\/subtitles\/[^"]+)"[^>]*>([^<]+)</gi;
+      // Subtitles list links match කිරීම (slug path එකට යටින් ඇති links)
+      const linkRegex = /href="(\/subtitles\/[^"#?]+)"[^>]*>([\s\S]*?)<\/a>/gi;
       let match;
-      let count = 0;
-      while ((match = linkRegex.exec(html)) !== null && count < 6) {
-        const pageUrl = `https://subsource.net${match[1]}`;
-        const label = match[2].trim();
-        if (label) {
-          results.push({
-            id: `subsrc_${count}`,
+
+      while ((match = linkRegex.exec(html)) !== null && found.length < 8) {
+        const href = match[1];
+        const fullUrl = `https://subsource.net${href}`;
+
+        // Season/show root link එකම නොවන, specific subtitle links ගැනීම
+        if (
+          fullUrl !== pageUrl &&
+          !seenUrls.has(fullUrl) &&
+          href.split("/").filter(Boolean).length >= 3
+        ) {
+          seenUrls.add(fullUrl);
+          const label = cleanText(match[2]) || href.split("/").pop();
+          found.push({
+            id: `subsrc_${found.length}`,
             source: "SubSource",
             title: label,
-            pageUrl,
-            suggestedName: `${label.replace(/[^\w.-]+/g, "_")}.zip`
+            pageUrl: fullUrl,
+            suggestedName: `${toSlug(label) || slug}.zip`
           });
-          count++;
         }
       }
+
+      if (found.length > 0) break;
+    } catch (e) {
+      console.error("SubSource fetch error:", pageUrl, e.message);
     }
-  } catch (e) {
-    console.error("SubSource search error:", e.message);
   }
-  return results;
+
+  return found;
 }
 
 async function resolveDownload(item) {
@@ -116,23 +157,31 @@ async function resolveDownload(item) {
     return { url: item.downloadUrl, filename: item.suggestedName };
   }
 
-  // SubSource subtitle page එකෙන් direct download link එකක් සෙවීමට උත්සාහ කිරීම
   if (item.pageUrl) {
-    const res = await fetch(item.pageUrl, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Mobile; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36"
-      }
-    });
-    if (res.ok) {
-      const html = await res.text();
-      const dlMatch = html.match(/href="(https?:\/\/[^"]*(?:\.zip|\.srt|\.ass|download)[^"]*)"/i);
-      if (dlMatch && dlMatch[1]) {
-        const foundUrl = dlMatch[1];
+    const res = await fetch(item.pageUrl, { headers: HEADERS });
+    if (!res.ok) return null;
+
+    const html = await res.text();
+    const patterns = [
+      /href="(https?:\/\/[^"]*(?:\.zip|\.srt|\.ass)[^"]*)"/i,
+      /href="(\/[^"]*download[^"]*)"/i,
+      /data-download-url="([^"]+)"/i
+    ];
+
+    for (const pat of patterns) {
+      const m = html.match(pat);
+      if (m && m[1]) {
+        const rawUrl = m[1];
+        const finalUrl = rawUrl.startsWith("http")
+          ? rawUrl
+          : `https://subsource.net${rawUrl.startsWith("/") ? "" : "/"}${rawUrl}`;
+
         let ext = ".zip";
-        if (/\.srt/i.test(foundUrl)) ext = ".srt";
-        else if (/\.ass/i.test(foundUrl)) ext = ".ass";
+        if (/\.srt/i.test(finalUrl)) ext = ".srt";
+        else if (/\.ass/i.test(finalUrl)) ext = ".ass";
+
         const base = item.suggestedName.replace(/\.(zip|srt|ass)$/i, "");
-        return { url: foundUrl, filename: `${base}${ext}` };
+        return { url: finalUrl, filename: `${base}${ext}` };
       }
     }
   }
@@ -152,7 +201,6 @@ export default async function handler(req, res) {
   const update = req.body || {};
 
   try {
-    // 1. Button click handle කිරීම
     if (update.callback_query) {
       const cq = update.callback_query;
       const chatId = cq.message.chat.id;
@@ -166,36 +214,30 @@ export default async function handler(req, res) {
         const chosen = userList.find((x) => x.id === itemId);
 
         if (!chosen) {
-          await sendMessage(chatId, "⚠️ Search results expired. කරුණාකර නැවත Anime හෝ Movie නම එවන්න.");
+          await sendMessage(chatId, "⚠️ Search results expired. කරුණාකර නැවත නම එවන්න.");
           return res.status(200).json({ ok: true });
         }
 
-        await sendMessage(chatId, `⏳ *${chosen.title}* සඳහා Subtitle file එක සකස් කරමින් පවතී...`);
+        await sendMessage(chatId, `⏳ *${chosen.title}* සඳහා file එක සකස් කරමින් පවතී...`);
 
         const resolved = await resolveDownload(chosen);
         if (!resolved || !resolved.url) {
           await sendMessage(
             chatId,
-            `❌ මෙම item එක සඳහා direct file link එක සොයාගත නොහැකි විය (Site protection හෝ structure වෙනසක් විය හැක).\n🔗 Page: ${chosen.pageUrl || "N/A"}`
+            `❌ Direct file link එක සොයාගත නොහැකි විය.\n🔗 Link: ${chosen.pageUrl || "N/A"}`
           );
           return res.status(200).json({ ok: true });
         }
 
-        const fileResp = await fetch(resolved.url, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (Mobile; Android 14) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36"
-          }
-        });
-
+        const fileResp = await fetch(resolved.url, { headers: HEADERS });
         if (!fileResp.ok) {
-          await sendMessage(chatId, `❌ File download failed (HTTP ${fileResp.status}).`);
+          await sendMessage(chatId, `❌ Download failed (HTTP ${fileResp.status}).`);
           return res.status(200).json({ ok: true });
         }
 
         const arrBuf = await fileResp.arrayBuffer();
         const buffer = Buffer.from(arrBuf);
 
-        // Filename extension නිවැරදි කිරීම (.srt / .ass / .zip)
         let finalName = resolved.filename;
         const disp = fileResp.headers.get("content-disposition") || "";
         const nameMatch = disp.match(/filename="?([^";]+)"?/i);
@@ -204,6 +246,7 @@ export default async function handler(req, res) {
         } else if (!/\.(srt|ass|zip)$/i.test(finalName)) {
           const ct = fileResp.headers.get("content-type") || "";
           if (ct.includes("zip")) finalName += ".zip";
+          else if (ct.includes("ass")) finalName += ".ass";
           else finalName += ".srt";
         }
 
@@ -218,7 +261,6 @@ export default async function handler(req, res) {
       return res.status(200).json({ ok: true });
     }
 
-    // 2. Text / Command messages handle කිරීම
     if (update.message && update.message.text) {
       const chatId = update.message.chat.id;
       const text = update.message.text.trim();
@@ -227,8 +269,8 @@ export default async function handler(req, res) {
         await sendMessage(
           chatId,
           "👋 *DG-DEV Subtitle Downloader Bot*\n\n" +
-            "🎬 Anime හෝ Movie එකක නම Type කර එවන්න.\n" +
-            "🔍 *SubDL* සහ *SubSource* වලින් results පෙන්වා, ඔබ තෝරන `.srt` / `.ass` / `.zip` ෆයිල් එක file එකක් විදිහට එවනු ලැබේ."
+            "🎬 Anime හෝ Movie නමක් Type කර එවන්න (උදා: `Trinity Seven`, `Naruto`).\n" +
+            "📄 Subtitles buttons තෝරා `.srt` / `.ass` / `.zip` file ලබාගන්න."
         );
         return res.status(200).json({ ok: true });
       }
@@ -237,7 +279,7 @@ export default async function handler(req, res) {
 
       const [subdlList, subsourceList] = await Promise.all([
         searchSubDL(text),
-        searchSubSource(text)
+        searchSubSourceBySlug(text)
       ]);
 
       const combined = [...subdlList, ...subsourceList].slice(0, 10);
@@ -245,8 +287,7 @@ export default async function handler(req, res) {
       if (combined.length === 0) {
         await sendMessage(
           chatId,
-          `😕 *"${text}"* සඳහා results හමු නොවීය (හෝ site එකෙන් request block කර ඇත).\n` +
-            `💡 ඉඟිය: Vercel Environment Variables වල \`SUBDL_API_KEY\` එකත් එකතු කර බලන්න.`
+          `😕 *"${text}"* සඳහා subtitles හමු නොවීය (හෝ site එකෙන් server requests block කර ඇත).`
         );
         return res.status(200).json({ ok: true });
       }
@@ -269,7 +310,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json({ ok: true });
   } catch (err) {
-    console.error("Bot handler error:", err);
+    console.error("Handler error:", err);
     return res.status(200).json({ ok: true });
   }
 }
