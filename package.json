@@ -1,0 +1,11 @@
+{
+  "name": "dg-dev-subtitle-bot",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node api/bot.js"
+  },
+  "engines": {
+    "node": "26.x"
+  }
+}
